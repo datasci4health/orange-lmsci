@@ -1,12 +1,6 @@
 """
 Orange Data Mining Widget: LM Task
 Interacts with a local Ollama server.
-
-Features:
-- Write prompts with {field} placeholders replaced by table columns
-- Connect an input table to iterate over rows
-- Output as text or augmented table (with 'llm' column)
-- Standalone mode: [Query] button and [Query on load] checkbox
 """
 
 import re
@@ -20,10 +14,9 @@ from AnyQt.QtWidgets import (
     QPlainTextEdit, QComboBox, QCheckBox, QPushButton,
     QLabel, QSizePolicy, QHBoxLayout, QVBoxLayout,
     QGroupBox, QProgressBar, QSplitter, QTextEdit,
-    QWidget, QFormLayout, QLineEdit
+    QLineEdit
 )
 from AnyQt.QtCore import Qt, QThread, pyqtSignal, QObject
-from AnyQt.QtGui import QFont
 
 import numpy as np
 
@@ -31,7 +24,6 @@ from Orange.widgets import gui
 from Orange.widgets.widget import OWWidget, Input, Output
 from Orange.widgets.settings import Setting
 from Orange.data import Table, Domain, StringVariable
-from Orange.data.io import guess_data_type
 
 
 OLLAMA_DEFAULT_URL = "http://localhost:11434"
@@ -42,19 +34,18 @@ OLLAMA_DEFAULT_URL = "http://localhost:11434"
 # ---------------------------------------------------------------------------
 
 class OllamaWorker(QObject):
-    """Run Ollama queries in a background thread."""
-    progress = pyqtSignal(int, int)          # current, total
-    result_text = pyqtSignal(str)            # single text result
-    result_row = pyqtSignal(int, str)        # row index + result
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
+    progress    = pyqtSignal(int, int)
+    result_text = pyqtSignal(str)
+    result_row  = pyqtSignal(int, str)
+    finished    = pyqtSignal()
+    error       = pyqtSignal(str)
 
     def __init__(self, url, model, prompts, mode="text"):
         super().__init__()
-        self._url = url.rstrip("/")
-        self._model = model
-        self._prompts = prompts   # list of (index, prompt_str)
-        self._mode = mode
+        self._url       = url.rstrip("/")
+        self._model     = model
+        self._prompts   = prompts   # list of (index, prompt_str)
+        self._mode      = mode
         self._cancelled = False
 
     def cancel(self):
@@ -71,14 +62,11 @@ class OllamaWorker(QObject):
                 self.error.emit(str(e))
                 self.finished.emit()
                 return
-
             self.progress.emit(i + 1, total)
-
             if self._mode == "text":
                 self.result_text.emit(response)
             else:
                 self.result_row.emit(row_idx, response)
-
         self.finished.emit()
 
     def _query(self, prompt):
@@ -87,7 +75,6 @@ class OllamaWorker(QObject):
             "prompt": prompt,
             "stream": False
         }).encode()
-
         req = urllib.request.Request(
             f"{self._url}/api/generate",
             data=payload,
@@ -100,11 +87,9 @@ class OllamaWorker(QObject):
 
 
 def fetch_ollama_models(url):
-    """Return list of model names from Ollama server, or empty list on error."""
     try:
         req = urllib.request.Request(
-            f"{url.rstrip('/')}/api/tags",
-            method="GET"
+            f"{url.rstrip('/')}/api/tags", method="GET"
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
@@ -114,7 +99,6 @@ def fetch_ollama_models(url):
 
 
 def build_prompt(template, row_dict):
-    """Replace {field} placeholders with values from row_dict."""
     def replacer(match):
         key = match.group(1)
         return str(row_dict.get(key, match.group(0)))
@@ -122,7 +106,6 @@ def build_prompt(template, row_dict):
 
 
 def extract_fields(template):
-    """Return list of {field} names found in the template."""
     return re.findall(r"\{(\w+)\}", template)
 
 
@@ -131,56 +114,63 @@ def extract_fields(template):
 # ---------------------------------------------------------------------------
 
 class OWLMTask(OWWidget):
-    name = "LM Task"
-    description = "Send prompts to a local Ollama server, optionally using input table columns as template fields."
-    icon = str(files("orange3lmsci") / "icons" / "LMTask.svg")
-    priority = 100
-    category = "LMSci"
-    keywords = ["llm", "ollama", "prompt", "language model"]
+    name        = "LM Task"
+    description = ("Send prompts to a local Ollama server, optionally using "
+                   "input table columns as template fields.")
+    icon        = str(files("orange3lmsci") / "icons" / "LMTask.svg")
+    priority    = 100
+    category    = "LMSci"
+    keywords    = ["llm", "ollama", "prompt", "language model"]
 
     want_main_area = True
 
-    # Inputs / Outputs
     class Inputs:
         data = Input("Data", Table, auto_summary=False)
 
     class Outputs:
         data = Output("Data", Table, auto_summary=False)
-        text = Output("Text", str, auto_summary=False)
+        text = Output("Text", str,   auto_summary=False)
 
-    # Persistent settings
-    ollama_url: str = Setting(OLLAMA_DEFAULT_URL)
-    selected_model: str = Setting("")
-    prompt_template: str = Setting("")
-    output_mode: str = Setting("text")   # "text" or "table"
-    query_on_load: bool = Setting(False)
+    # Settings
+    ollama_url      : str  = Setting(OLLAMA_DEFAULT_URL)
+    selected_model  : str  = Setting("")
+    prompt_template : str  = Setting("")
+    # FIX #2 — store as int (radio-button index); 0=text, 1=table
+    output_mode_idx : int  = Setting(0)
+    query_on_load   : bool = Setting(False)
+
+    OUTPUT_MODES = ["text", "table"]
 
     def __init__(self):
         super().__init__()
-        self._input_data = None
-        self._worker = None
-        self._thread = None
-        self._row_results = {}   # row_idx -> str
+        self._input_data  = None
+        self._worker      = None
+        self._thread      = None
+        self._row_results = {}
 
         self._build_control_area()
         self._build_main_area()
 
-        # Refresh model list on startup (non-blocking)
+        # FIX #1 — refresh models using a plain daemon thread + Qt signal
+        self._models_ready.connect(self._update_model_list)
         threading.Thread(target=self._refresh_models_bg, daemon=True).start()
 
-        if self.query_on_load and not self._input_data:
-            # Defer until event loop is running
+        if self.query_on_load and self._input_data is None:
             from AnyQt.QtCore import QTimer
             QTimer.singleShot(500, self._run_query)
 
+    # Signal used to safely deliver model list to the main thread
+    from AnyQt.QtCore import pyqtSignal as _sig
+    _models_ready = _sig(list)
+
     # ------------------------------------------------------------------
-    # UI construction
+    # UI
     # ------------------------------------------------------------------
 
     def _build_control_area(self):
         ca = self.controlArea
 
-        # --- Ollama server ---
+        # Server box
         server_box = gui.vBox(ca, "Ollama Server")
 
         url_row = QHBoxLayout()
@@ -205,17 +195,14 @@ class OWLMTask(OWWidget):
         model_row.addWidget(self._refresh_btn)
         server_box.layout().addLayout(model_row)
 
-        # --- Output mode ---
+        # Output mode  — FIX #2: bind to output_mode_idx (int)
         out_box = gui.vBox(ca, "Output")
         gui.radioButtonsInBox(
-            out_box, self, "output_mode",
+            out_box, self, "output_mode_idx",
             btnLabels=["Text", "Table (adds 'llm' column)"],
-            callback=self._on_output_mode_changed
         )
-        # Map radio index to string value
-        self._output_mode_values = ["text", "table"]
 
-        # --- Standalone controls ---
+        # Standalone controls
         standalone_box = gui.vBox(ca, "Standalone Mode")
         self._query_btn = gui.button(
             standalone_box, self, "Query", callback=self._run_query
@@ -224,7 +211,7 @@ class OWLMTask(OWWidget):
             standalone_box, self, "query_on_load", "Query on load"
         )
 
-        # --- Progress ---
+        # Progress / cancel
         self._progress_bar = QProgressBar()
         self._progress_bar.setVisible(False)
         ca.layout().addWidget(self._progress_bar)
@@ -240,14 +227,12 @@ class OWLMTask(OWWidget):
         splitter = QSplitter(Qt.Vertical)
         ma.layout().addWidget(splitter)
 
-        # --- Prompt editor ---
+        # Prompt editor
         prompt_group = QGroupBox("Prompt Template")
         prompt_layout = QVBoxLayout()
         prompt_group.setLayout(prompt_layout)
 
-        hint = QLabel(
-            "Use {column_name} as placeholders for input table columns."
-        )
+        hint = QLabel("Use {column_name} placeholders for input table columns.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray; font-size: 11px;")
         prompt_layout.addWidget(hint)
@@ -257,6 +242,7 @@ class OWLMTask(OWWidget):
             "e.g. Summarize the following text:\n\n{text}"
         )
         self._prompt_edit.setPlainText(self.prompt_template)
+        from AnyQt.QtGui import QFont
         self._prompt_edit.setFont(QFont("Courier New", 10))
         self._prompt_edit.textChanged.connect(self._on_prompt_changed)
         prompt_layout.addWidget(self._prompt_edit)
@@ -266,13 +252,14 @@ class OWLMTask(OWWidget):
         prompt_layout.addWidget(self._fields_label)
         splitter.addWidget(prompt_group)
 
-        # --- Output viewer ---
+        # Output viewer
         output_group = QGroupBox("Output")
         output_layout = QVBoxLayout()
         output_group.setLayout(output_layout)
 
         self._output_view = QTextEdit()
         self._output_view.setReadOnly(True)
+        from AnyQt.QtGui import QFont
         self._output_view.setFont(QFont("Courier New", 10))
         output_layout.addWidget(self._output_view)
         splitter.addWidget(output_group)
@@ -281,44 +268,23 @@ class OWLMTask(OWWidget):
         self._update_fields_label()
 
     # ------------------------------------------------------------------
-    # Input handling
+    # Input
     # ------------------------------------------------------------------
 
     @Inputs.data
     def set_data(self, data):
         self._input_data = data
         has_input = data is not None
-
-        # Disable standalone controls when table is connected
         self._query_btn.setEnabled(not has_input)
         self._qol_checkbox.setEnabled(not has_input)
-
         self._update_fields_label()
-
         if has_input:
             self._output_view.clear()
             self._run_query()
 
     # ------------------------------------------------------------------
-    # Settings helpers
+    # Settings callbacks
     # ------------------------------------------------------------------
-
-    # Orange radioButtonsInBox stores 0/1 in output_mode as int when using
-    # the attribute name. We store "text"/"table" as the setting string but
-    # use an index internally. Override with property tricks via callbacks.
-
-    def _get_output_mode_idx(self):
-        try:
-            return self._output_mode_values.index(self.output_mode)
-        except ValueError:
-            return 0
-
-    def _on_output_mode_changed(self):
-        # The radioButtons widget sets self.output_mode to the index (int)
-        # when callback fires; convert back to string.
-        idx = self.output_mode if isinstance(self.output_mode, int) else self._get_output_mode_idx()
-        if isinstance(idx, int) and 0 <= idx < len(self._output_mode_values):
-            self.output_mode = self._output_mode_values[idx]
 
     def _on_url_changed(self):
         self.ollama_url = self._url_edit.text().strip() or OLLAMA_DEFAULT_URL
@@ -332,7 +298,7 @@ class OWLMTask(OWWidget):
         self._update_fields_label()
 
     # ------------------------------------------------------------------
-    # Model list
+    # Model list  (FIX #1)
     # ------------------------------------------------------------------
 
     def _refresh_models(self):
@@ -340,15 +306,14 @@ class OWLMTask(OWWidget):
         threading.Thread(target=self._refresh_models_bg, daemon=True).start()
 
     def _refresh_models_bg(self):
+        """Runs in daemon thread; emits signal to deliver results safely."""
         models = fetch_ollama_models(self.ollama_url)
-        # Update UI on main thread
-        from AnyQt.QtCore import QMetaObject, Q_ARG
-        QMetaObject.invokeMethod(self, "_update_model_list",
-                                 Qt.QueuedConnection,
-                                 Q_ARG("PyQt_PyObject", models))
+        self._models_ready.emit(models)          # crosses thread boundary safely
 
     def _update_model_list(self, models):
+        """Runs on main thread via signal."""
         current = self._model_combo.currentText() or self.selected_model
+        self._model_combo.blockSignals(True)
         self._model_combo.clear()
         if models:
             self._model_combo.addItems(models)
@@ -356,11 +321,14 @@ class OWLMTask(OWWidget):
                 self._model_combo.setCurrentText(current)
             elif self.selected_model in models:
                 self._model_combo.setCurrentText(self.selected_model)
+            else:
+                self._model_combo.setCurrentIndex(0)
         else:
-            # Server unreachable; allow manual entry
             if self.selected_model:
                 self._model_combo.addItem(self.selected_model)
                 self._model_combo.setCurrentText(self.selected_model)
+        self._model_combo.blockSignals(False)
+        self.selected_model = self._model_combo.currentText()
         self._refresh_btn.setEnabled(True)
 
     # ------------------------------------------------------------------
@@ -370,14 +338,16 @@ class OWLMTask(OWWidget):
     def _update_fields_label(self):
         fields = extract_fields(self.prompt_template)
         if fields:
-            self._fields_label.setText(f"Fields detected: {', '.join(f'{{{f}}}' for f in fields)}")
+            self._fields_label.setText(
+                f"Fields detected: {', '.join('{' + f + '}' for f in fields)}"
+            )
         else:
             self._fields_label.setText("No {field} placeholders detected.")
 
-        # Warn about missing columns if table is connected
         if self._input_data is not None and fields:
-            col_names = [v.name for v in self._input_data.domain.variables
-                         + self._input_data.domain.metas]
+            col_names = [v.name for v in
+                         list(self._input_data.domain.variables) +
+                         list(self._input_data.domain.metas)]
             missing = [f for f in fields if f not in col_names]
             if missing:
                 self._fields_label.setText(
@@ -386,7 +356,7 @@ class OWLMTask(OWWidget):
                 )
 
     # ------------------------------------------------------------------
-    # Query execution
+    # Query
     # ------------------------------------------------------------------
 
     def _run_query(self):
@@ -408,33 +378,29 @@ class OWLMTask(OWWidget):
         if self._input_data is not None:
             prompts = self._build_table_prompts(template)
         else:
-            # Standalone: single query with template as-is
             prompts = [(0, template)]
 
         self._start_worker(prompts, model)
 
     def _build_table_prompts(self, template):
-        data = self._input_data
-        domain = data.domain
-        all_vars = list(domain.variables) + list(domain.metas)
-
-        prompts = []
+        data     = self._input_data
+        all_vars = list(data.domain.variables) + list(data.domain.metas)
+        prompts  = []
         for i, row in enumerate(data):
             row_dict = {}
             for var in all_vars:
                 try:
                     val = row[var]
-                    row_dict[var.name] = var.repr_val(val) if hasattr(var, "repr_val") else str(val)
+                    row_dict[var.name] = (var.repr_val(val)
+                                          if hasattr(var, "repr_val")
+                                          else str(val))
                 except Exception:
                     row_dict[var.name] = ""
             prompts.append((i, build_prompt(template, row_dict)))
         return prompts
 
     def _start_worker(self, prompts, model):
-        # Determine output mode string
-        mode = self.output_mode
-        if isinstance(mode, int):
-            mode = self._output_mode_values[mode] if mode < len(self._output_mode_values) else "text"
+        mode = self.OUTPUT_MODES[self.output_mode_idx]
 
         self._worker = OllamaWorker(self.ollama_url, model, prompts, mode=mode)
         self._thread = QThread()
@@ -473,7 +439,6 @@ class OWLMTask(OWWidget):
 
     def _on_result_row(self, row_idx, text):
         self._row_results[row_idx] = text
-        # Show in output viewer
         self._output_view.append(f"[Row {row_idx}] {text}\n")
 
     def _on_error(self, msg):
@@ -482,11 +447,7 @@ class OWLMTask(OWWidget):
 
     def _on_finished(self):
         self._cleanup_thread()
-
-        mode = self.output_mode
-        if isinstance(mode, int):
-            mode = self._output_mode_values[mode] if mode < len(self._output_mode_values) else "text"
-
+        mode = self.OUTPUT_MODES[self.output_mode_idx]
         if mode == "table" and self._input_data is not None and self._row_results:
             self._emit_table()
 
@@ -507,29 +468,26 @@ class OWLMTask(OWWidget):
 
     def _emit_table(self):
         data = self._input_data
-        n = len(data)
+        n    = len(data)
 
         llm_values = np.array(
             [self._row_results.get(i, "") for i in range(n)],
             dtype=object
         ).reshape(-1, 1)
 
-        llm_var = StringVariable("llm")
+        llm_var    = StringVariable("llm")
         new_domain = Domain(
             data.domain.attributes,
             data.domain.class_vars,
             list(data.domain.metas) + [llm_var]
         )
-        new_table = data.transform(new_domain)
-        # Append the llm column to metas
-        if data.metas.shape[1] > 0:
+
+        if data.metas.size:
             new_metas = np.hstack([data.metas, llm_values])
         else:
             new_metas = llm_values
 
-        # Rebuild table with updated metas
-        from Orange.data import Table as OTable
-        out = OTable.from_numpy(
+        out = Table.from_numpy(
             new_domain,
             X=data.X,
             Y=data.Y if data.Y.size else None,

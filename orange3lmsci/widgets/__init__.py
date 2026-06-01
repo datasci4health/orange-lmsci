@@ -8,7 +8,7 @@ BACKGROUND = "#9FFFBD"
 PRIORITY = 3
 
 WIDGETS = [
-    "lm_task"
+    'OWLMTask'
 ]
 
 # The .py file where each widget is implemented
