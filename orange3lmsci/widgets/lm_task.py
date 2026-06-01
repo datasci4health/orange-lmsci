@@ -148,6 +148,8 @@ class OWLMTask(OWWidget):
     output_mode_idx  : int  = Setting(0)   # 0=text, 1=table
     query_auto       : bool = Setting(False)
     split_last_line  : bool = Setting(False)
+    llm_col_name     : str  = Setting("llm")
+    llm_summary_name : str  = Setting("llm summary")
 
     OUTPUT_MODES = ["text", "table"]
 
@@ -205,17 +207,60 @@ class OWLMTask(OWWidget):
 
         # --- Output mode ---
         out_box = gui.vBox(ca, "Output")
+        # "Text" radio
         gui.radioButtonsInBox(
             out_box, self, "output_mode_idx",
-            btnLabels=["Text", "Table (adds 'llm' column)"],
+            btnLabels=["Text"],
         )
+        # "Table" radio + inline column-name field on the same row
+        table_row = QHBoxLayout()
+        from AnyQt.QtWidgets import QRadioButton
+        self._table_radio = QRadioButton("Table  →  column:")
+        self._table_radio.setChecked(self.output_mode_idx == 1)
+        self._table_radio.toggled.connect(self._on_table_radio_toggled)
+        table_row.addWidget(self._table_radio)
+        self._llm_col_edit = QLineEdit(self.llm_col_name)
+        self._llm_col_edit.setFixedWidth(90)
+        self._llm_col_edit.editingFinished.connect(self._on_llm_col_name_changed)
+        table_row.addWidget(self._llm_col_edit)
+        table_row.addStretch()
+        out_box.layout().addLayout(table_row)
+        # Keep both radio buttons in the same exclusive group
+        from AnyQt.QtWidgets import QButtonGroup
+        # Retrieve the radio created by radioButtonsInBox (first child button)
+        self._text_radio = None
+        for child in out_box.findChildren(QRadioButton):
+            if child is not self._table_radio:
+                self._text_radio = child
+                break
+        if self._text_radio is not None:
+            self._radio_group = QButtonGroup(out_box)
+            self._radio_group.addButton(self._text_radio, 0)
+            self._radio_group.addButton(self._table_radio, 1)
+            self._radio_group.buttonClicked[int].connect(self._on_radio_group_clicked)
+            # Sync initial state
+            if self.output_mode_idx == 1:
+                self._table_radio.setChecked(True)
+                self._text_radio.setChecked(False)
+            else:
+                self._text_radio.setChecked(True)
+                self._table_radio.setChecked(False)
 
         # --- Options (table-mode extras) ---
         opt_box = gui.vBox(ca, "Options")
+        split_row = QHBoxLayout()
         self._split_cb = gui.checkBox(
-            opt_box, self, "split_last_line",
-            "Split last line  (adds 'llm summary' column)"
+            opt_box, self, "split_last_line", "Split last line  →  column:"
         )
+        # Move the checkbox into the horizontal row
+        opt_box.layout().removeWidget(self._split_cb)
+        split_row.addWidget(self._split_cb)
+        self._llm_summary_edit = QLineEdit(self.llm_summary_name)
+        self._llm_summary_edit.setFixedWidth(90)
+        self._llm_summary_edit.editingFinished.connect(self._on_llm_summary_name_changed)
+        split_row.addWidget(self._llm_summary_edit)
+        split_row.addStretch()
+        opt_box.layout().addLayout(split_row)
 
         # --- Query controls (always enabled) ---
         query_box = gui.vBox(ca, "Query")
@@ -302,6 +347,25 @@ class OWLMTask(OWWidget):
     # ------------------------------------------------------------------
     # Settings callbacks
     # ------------------------------------------------------------------
+
+    def _on_radio_group_clicked(self, btn_id):
+        self.output_mode_idx = btn_id
+
+    def _on_table_radio_toggled(self, checked):
+        if checked:
+            self.output_mode_idx = 1
+
+    def _on_llm_col_name_changed(self):
+        name = self._llm_col_edit.text().strip()
+        self.llm_col_name = name if name else "llm"
+        if not name:
+            self._llm_col_edit.setText(self.llm_col_name)
+
+    def _on_llm_summary_name_changed(self):
+        name = self._llm_summary_edit.text().strip()
+        self.llm_summary_name = name if name else "llm summary"
+        if not name:
+            self._llm_summary_edit.setText(self.llm_summary_name)
 
     def _on_url_changed(self):
         self.ollama_url = self._url_edit.text().strip() or OLLAMA_DEFAULT_URL
@@ -493,7 +557,7 @@ class OWLMTask(OWWidget):
             dtype=object
         ).reshape(-1, 1)
 
-        extra_vars = [StringVariable("llm")]
+        extra_vars = [StringVariable(self.llm_col_name or "llm")]
         extra_cols = [llm_values]
 
         # Split-last-line column
@@ -502,7 +566,7 @@ class OWLMTask(OWWidget):
                 [extract_last_line(self._row_results.get(i, "")) for i in range(n)],
                 dtype=object
             ).reshape(-1, 1)
-            extra_vars.append(StringVariable("llm summary"))
+            extra_vars.append(StringVariable(self.llm_summary_name or "llm summary"))
             extra_cols.append(summary_values)
 
         new_domain = Domain(
