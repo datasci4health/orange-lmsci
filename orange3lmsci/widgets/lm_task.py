@@ -11,7 +11,7 @@ import urllib.error
 from importlib.resources import files
 
 from AnyQt.QtWidgets import (
-    QPlainTextEdit, QComboBox, QCheckBox, QPushButton,
+    QPlainTextEdit, QComboBox, QPushButton,
     QLabel, QSizePolicy, QHBoxLayout, QVBoxLayout,
     QGroupBox, QProgressBar, QSplitter, QTextEdit,
     QLineEdit
@@ -27,6 +27,39 @@ from Orange.data import Table, Domain, StringVariable
 
 
 OLLAMA_DEFAULT_URL = "http://localhost:11434"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def fetch_ollama_models(url):
+    try:
+        req = urllib.request.Request(
+            f"{url.rstrip('/')}/api/tags", method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
+
+
+def build_prompt(template, row_dict):
+    def replacer(match):
+        key = match.group(1)
+        return str(row_dict.get(key, match.group(0)))
+    return re.sub(r"\{(\w+)\}", replacer, template)
+
+
+def extract_fields(template):
+    return re.findall(r"\{(\w+)\}", template)
+
+
+def extract_last_line(text):
+    """Return the last non-empty line of *text*."""
+    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+    return lines[-1] if lines else ""
 
 
 # ---------------------------------------------------------------------------
@@ -86,29 +119,6 @@ class OllamaWorker(QObject):
         return data.get("response", "")
 
 
-def fetch_ollama_models(url):
-    try:
-        req = urllib.request.Request(
-            f"{url.rstrip('/')}/api/tags", method="GET"
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-        return [m["name"] for m in data.get("models", [])]
-    except Exception:
-        return []
-
-
-def build_prompt(template, row_dict):
-    def replacer(match):
-        key = match.group(1)
-        return str(row_dict.get(key, match.group(0)))
-    return re.sub(r"\{(\w+)\}", replacer, template)
-
-
-def extract_fields(template):
-    return re.findall(r"\{(\w+)\}", template)
-
-
 # ---------------------------------------------------------------------------
 # Widget
 # ---------------------------------------------------------------------------
@@ -131,46 +141,44 @@ class OWLMTask(OWWidget):
         data = Output("Data", Table, auto_summary=False)
         text = Output("Text", str,   auto_summary=False)
 
-    # Settings
-    ollama_url      : str  = Setting(OLLAMA_DEFAULT_URL)
-    selected_model  : str  = Setting("")
-    prompt_template : str  = Setting("")
-    # FIX #2 — store as int (radio-button index); 0=text, 1=table
-    output_mode_idx : int  = Setting(0)
-    query_on_load   : bool = Setting(False)
+    # ---- Persistent settings ----
+    ollama_url       : str  = Setting(OLLAMA_DEFAULT_URL)
+    selected_model   : str  = Setting("")
+    prompt_template  : str  = Setting("")
+    output_mode_idx  : int  = Setting(0)   # 0=text, 1=table
+    query_auto       : bool = Setting(False)
+    split_last_line  : bool = Setting(False)
 
     OUTPUT_MODES = ["text", "table"]
+
+    # Signal to safely deliver model list from background thread
+    _models_ready = pyqtSignal(list)
 
     def __init__(self):
         super().__init__()
         self._input_data  = None
         self._worker      = None
         self._thread      = None
-        self._row_results = {}
+        self._row_results = {}   # row_idx -> full response str
 
         self._build_control_area()
         self._build_main_area()
 
-        # FIX #1 — refresh models using a plain daemon thread + Qt signal
         self._models_ready.connect(self._update_model_list)
         threading.Thread(target=self._refresh_models_bg, daemon=True).start()
 
-        if self.query_on_load and self._input_data is None:
+        if self.query_auto:
             from AnyQt.QtCore import QTimer
             QTimer.singleShot(500, self._run_query)
 
-    # Signal used to safely deliver model list to the main thread
-    from AnyQt.QtCore import pyqtSignal as _sig
-    _models_ready = _sig(list)
-
     # ------------------------------------------------------------------
-    # UI
+    # UI – control area
     # ------------------------------------------------------------------
 
     def _build_control_area(self):
         ca = self.controlArea
 
-        # Server box
+        # --- Ollama server ---
         server_box = gui.vBox(ca, "Ollama Server")
 
         url_row = QHBoxLayout()
@@ -195,23 +203,30 @@ class OWLMTask(OWWidget):
         model_row.addWidget(self._refresh_btn)
         server_box.layout().addLayout(model_row)
 
-        # Output mode  — FIX #2: bind to output_mode_idx (int)
+        # --- Output mode ---
         out_box = gui.vBox(ca, "Output")
         gui.radioButtonsInBox(
             out_box, self, "output_mode_idx",
             btnLabels=["Text", "Table (adds 'llm' column)"],
         )
 
-        # Standalone controls
-        standalone_box = gui.vBox(ca, "Standalone Mode")
-        self._query_btn = gui.button(
-            standalone_box, self, "Query", callback=self._run_query
-        )
-        self._qol_checkbox = gui.checkBox(
-            standalone_box, self, "query_on_load", "Query on load"
+        # --- Options (table-mode extras) ---
+        opt_box = gui.vBox(ca, "Options")
+        self._split_cb = gui.checkBox(
+            opt_box, self, "split_last_line",
+            "Split last line  (adds 'llm summary' column)"
         )
 
-        # Progress / cancel
+        # --- Query controls (always enabled) ---
+        query_box = gui.vBox(ca, "Query")
+        self._query_btn = gui.button(
+            query_box, self, "Query", callback=self._run_query
+        )
+        self._auto_cb = gui.checkBox(
+            query_box, self, "query_auto", "Query automatically"
+        )
+
+        # --- Progress / cancel ---
         self._progress_bar = QProgressBar()
         self._progress_bar.setVisible(False)
         ca.layout().addWidget(self._progress_bar)
@@ -220,6 +235,10 @@ class OWLMTask(OWWidget):
         self._cancel_btn.setVisible(False)
 
         gui.rubber(ca)
+
+    # ------------------------------------------------------------------
+    # UI – main area
+    # ------------------------------------------------------------------
 
     def _build_main_area(self):
         ma = self.mainArea
@@ -268,17 +287,15 @@ class OWLMTask(OWWidget):
         self._update_fields_label()
 
     # ------------------------------------------------------------------
-    # Input
+    # Input handler
     # ------------------------------------------------------------------
 
     @Inputs.data
     def set_data(self, data):
         self._input_data = data
-        has_input = data is not None
-        self._query_btn.setEnabled(not has_input)
-        self._qol_checkbox.setEnabled(not has_input)
         self._update_fields_label()
-        if has_input:
+        # Auto-query whenever input changes (connect/disconnect/replace)
+        if self.query_auto:
             self._output_view.clear()
             self._run_query()
 
@@ -298,7 +315,7 @@ class OWLMTask(OWWidget):
         self._update_fields_label()
 
     # ------------------------------------------------------------------
-    # Model list  (FIX #1)
+    # Model list
     # ------------------------------------------------------------------
 
     def _refresh_models(self):
@@ -306,12 +323,10 @@ class OWLMTask(OWWidget):
         threading.Thread(target=self._refresh_models_bg, daemon=True).start()
 
     def _refresh_models_bg(self):
-        """Runs in daemon thread; emits signal to deliver results safely."""
         models = fetch_ollama_models(self.ollama_url)
-        self._models_ready.emit(models)          # crosses thread boundary safely
+        self._models_ready.emit(models)
 
     def _update_model_list(self, models):
-        """Runs on main thread via signal."""
         current = self._model_combo.currentText() or self.selected_model
         self._model_combo.blockSignals(True)
         self._model_combo.clear()
@@ -339,7 +354,7 @@ class OWLMTask(OWWidget):
         fields = extract_fields(self.prompt_template)
         if fields:
             self._fields_label.setText(
-                f"Fields detected: {', '.join('{' + f + '}' for f in fields)}"
+                "Fields detected: " + ", ".join("{" + f + "}" for f in fields)
             )
         else:
             self._fields_label.setText("No {field} placeholders detected.")
@@ -352,7 +367,7 @@ class OWLMTask(OWWidget):
             if missing:
                 self._fields_label.setText(
                     self._fields_label.text() +
-                    f"  ⚠ Missing columns: {', '.join(missing)}"
+                    "  ⚠ Missing columns: " + ", ".join(missing)
                 )
 
     # ------------------------------------------------------------------
@@ -360,6 +375,10 @@ class OWLMTask(OWWidget):
     # ------------------------------------------------------------------
 
     def _run_query(self):
+        # Cancel any in-progress run first
+        if self._worker is not None:
+            self._worker.cancel()
+
         template = self._prompt_edit.toPlainText().strip()
         if not template:
             self.warning("Please enter a prompt template.")
@@ -454,8 +473,7 @@ class OWLMTask(OWWidget):
     def _cleanup_thread(self):
         self._progress_bar.setVisible(False)
         self._cancel_btn.setVisible(False)
-        has_input = self._input_data is not None
-        self._query_btn.setEnabled(not has_input)
+        self._query_btn.setEnabled(True)
         if self._thread:
             self._thread.quit()
             self._thread.wait()
@@ -475,17 +493,28 @@ class OWLMTask(OWWidget):
             dtype=object
         ).reshape(-1, 1)
 
-        llm_var    = StringVariable("llm")
+        extra_vars = [StringVariable("llm")]
+        extra_cols = [llm_values]
+
+        # Split-last-line column
+        if self.split_last_line:
+            summary_values = np.array(
+                [extract_last_line(self._row_results.get(i, "")) for i in range(n)],
+                dtype=object
+            ).reshape(-1, 1)
+            extra_vars.append(StringVariable("llm summary"))
+            extra_cols.append(summary_values)
+
         new_domain = Domain(
             data.domain.attributes,
             data.domain.class_vars,
-            list(data.domain.metas) + [llm_var]
+            list(data.domain.metas) + extra_vars
         )
 
         if data.metas.size:
-            new_metas = np.hstack([data.metas, llm_values])
+            new_metas = np.hstack([data.metas] + extra_cols)
         else:
-            new_metas = llm_values
+            new_metas = np.hstack(extra_cols)
 
         out = Table.from_numpy(
             new_domain,
