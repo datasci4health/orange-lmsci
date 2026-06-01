@@ -1,0 +1,4 @@
+include LICENSE
+include README.md
+recursive-include orange3lmsci/icons *.svg *.png
+recursive-include orange3lmsci *.py
